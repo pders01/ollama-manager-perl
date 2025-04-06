@@ -6,7 +6,7 @@ use v5.32.0;
 
 use File::Spec  ();
 use File::Which ();
-use POSIX       qw( chmod close exit fork kill open setsid sleep unlink );
+use POSIX       qw( chmod close fork kill open setsid sleep unlink );
 use Carp        qw( carp croak );
 use Cwd         qw( abs_path );
 use HTTP::Tiny  ();
