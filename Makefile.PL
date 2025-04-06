@@ -16,7 +16,7 @@ WriteMakefile(
         'IPC::Run'      => 0,
     },
     ABSTRACT_FROM     => 'lib/Ollama/Manager.pm',
-    AUTHOR            => 'Your Name <your.email@example.com>',
+    AUTHOR            => 'Paul Derscheid <me@paulderscheid.xyz>',
     LICENSE           => 'perl',
     MIN_PERL_VERSION  => '5.032000',
 ); 
