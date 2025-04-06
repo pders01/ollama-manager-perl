@@ -4,7 +4,6 @@ use strict;
 use warnings;
 use v5.32.0;
 
-use File::Spec  ();
 use File::Which ();
 use POSIX       qw( chmod close fork kill open setsid sleep unlink );
 use Carp        qw( carp croak );
@@ -29,10 +28,24 @@ sub _initialize {
     my %args = @_;
 
     $self->{config} = {
-        ollama_path => $args{ollama_path},    # Explicit path override
+        ollama_path => $args{ollama_path},                         # Explicit path override
         install_url => $args{install_url} || OLLAMA_INSTALL_URL,
-        pid_file    => $args{pid_file}    || File::Spec->catfile( File::Spec->tmpdir, 'ollama.pid' ),
+        pid_file    => $args{pid_file},                            # No default, must be provided
     };
+
+    # Validate PID file if provided
+    if ( $self->{config}{pid_file} ) {
+        my $pid_file = $self->{config}{pid_file};
+        if ( -e $pid_file && !-r $pid_file ) {
+            croak "PID file '$pid_file' exists but is not readable";
+        }
+        if ( -e $pid_file && !-w $pid_file ) {
+            croak "PID file '$pid_file' exists but is not writable";
+        }
+    }
+    else {
+        croak "PID file path must be provided to manage Ollama server process";
+    }
 
     $self->_find_ollama();
 }
@@ -71,6 +84,11 @@ sub version {
     my ( $stdout, $stderr );
     if ( run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr ) ) {
         chomp $stdout;
+
+        # Extract version number from output
+        if ( $stdout =~ /^ollama version is (\d+\.\d+\.\d+)/ ) {
+            return $1;
+        }
         return $stdout;
     }
 
@@ -228,7 +246,9 @@ Ollama::Manager - Perl interface for managing Ollama installation and server pro
 
     use Ollama::Manager;
     
-    my $ollama = Ollama::Manager->new();
+    my $ollama = Ollama::Manager->new(
+        pid_file => '/path/to/ollama.pid'  # Required
+    );
     
     # Install Ollama if not present
     if (!$ollama->is_installed) {
@@ -257,21 +277,21 @@ including installation, updates, and controlling the server process.
 
 =item new(%args)
 
-Constructor. Accepts the following optional arguments:
+Constructor. Accepts the following arguments:
 
 =over 4
 
+=item pid_file
+
+Path to the PID file (required). This file is used to track the Ollama server process.
+
 =item ollama_path
 
-Explicit path to the ollama executable.
+Explicit path to the ollama executable (optional).
 
 =item install_url
 
-URL for the Ollama installation script.
-
-=item pid_file
-
-Path to store the PID file.
+URL for the Ollama installation script (optional).
 
 =back
 
