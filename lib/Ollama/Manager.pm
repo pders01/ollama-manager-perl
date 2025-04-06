@@ -328,7 +328,7 @@ Returns the PID of the running Ollama server process, or undef if not running.
 
 =head1 AUTHOR
 
-Your Name <your.email@example.com>
+Paul Derscheid <me@paulderscheid.xyz>
 
 =head1 LICENSE
 
