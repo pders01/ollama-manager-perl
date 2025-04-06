@@ -35,10 +35,8 @@ make install
 ```perl
 use Ollama::Manager;
 
-# Create a new manager instance with required PID file
-my $ollama = Ollama::Manager->new(
-    pid_file => '/path/to/ollama.pid'  # Required for process management
-);
+# Create a new manager instance
+my $ollama = Ollama::Manager->new();
 
 # Install Ollama if not present
 if (!$ollama->is_installed) {
@@ -61,11 +59,10 @@ $ollama->stop();
 
 ### new(%args)
 
-Constructor. Accepts the following arguments:
+Constructor. Accepts the following optional arguments:
 
-- `pid_file`: Path to the PID file (required). This file is used to track the Ollama server process.
-- `ollama_path`: Explicit path to the ollama executable (optional)
-- `install_url`: URL for the Ollama installation script (optional)
+- `ollama_path`: Explicit path to the ollama executable
+- `install_url`: URL for the Ollama installation script
 
 ### is_installed()
 
@@ -81,7 +78,7 @@ Installs Ollama. Accepts:
 
 - `force`: Force reinstallation even if already installed
 
-### start(%args)
+### start()
 
 Starts the Ollama server process.
 
@@ -97,7 +94,7 @@ Restarts the Ollama server process.
 
 ### status()
 
-Returns the server status: 'RUNNING', 'STOPPED', or 'UNKNOWN'.
+Returns the server status: 'RUNNING' or 'STOPPED'.
 
 ### pid()
 
@@ -105,8 +102,7 @@ Returns the PID of the running Ollama server process, or undef if not running.
 
 ## Important Notes
 
-- The `pid_file` parameter is required to manage the Ollama server process
-- The PID file must be readable and writable by the process
+- The module uses Ollama's built-in commands for process management
 - Installation requires appropriate system permissions
 - The module supports Unix-like systems (Linux, macOS, BSD)
 

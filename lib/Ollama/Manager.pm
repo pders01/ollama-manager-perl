@@ -5,7 +5,7 @@ use warnings;
 use v5.32.0;
 
 use File::Which ();
-use POSIX       qw( chmod close fork kill open setsid sleep unlink );
+use POSIX       qw( kill );
 use Carp        qw( carp croak );
 use Cwd         qw( abs_path );
 use HTTP::Tiny  ();
@@ -30,22 +30,7 @@ sub _initialize {
     $self->{config} = {
         ollama_path => $args{ollama_path},                         # Explicit path override
         install_url => $args{install_url} || OLLAMA_INSTALL_URL,
-        pid_file    => $args{pid_file},                            # No default, must be provided
     };
-
-    # Validate PID file if provided
-    if ( $self->{config}{pid_file} ) {
-        my $pid_file = $self->{config}{pid_file};
-        if ( -e $pid_file && !-r $pid_file ) {
-            croak "PID file '$pid_file' exists but is not readable";
-        }
-        if ( -e $pid_file && !-w $pid_file ) {
-            croak "PID file '$pid_file' exists but is not writable";
-        }
-    }
-    else {
-        croak "PID file path must be provided to manage Ollama server process";
-    }
 
     $self->_find_ollama();
 }
@@ -82,17 +67,35 @@ sub version {
     croak "Ollama is not installed" unless $self->is_installed;
 
     my ( $stdout, $stderr );
-    if ( run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr ) ) {
-        chomp $stdout;
+    my $success = eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;  # 5 second timeout
+        my $result = run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr );
+        alarm 0;
+        return $result;
+    };
 
-        # Extract version number from output
-        if ( $stdout =~ /^ollama version is (\d+\.\d+\.\d+)/ ) {
-            return $1;
+    if ($@) {
+        if ($@ eq "timeout\n") {
+            croak "Timeout while getting Ollama version";
         }
-        return $stdout;
+        croak "Failed to execute ollama --version: $@";
     }
 
-    croak "Failed to get Ollama version: $stderr";
+    if (!$success) {
+        croak "Failed to get Ollama version: $stderr";
+    }
+
+    chomp $stdout;
+    return $stdout if !$stdout;  # Return empty string if no output
+
+    # Extract version number from output
+    if ( $stdout =~ /^ollama version is (\d+\.\d+\.\d+)/ ) {
+        return $1;
+    }
+
+    # If we can't parse the version, return the raw output
+    return $stdout;
 }
 
 sub install {
@@ -138,14 +141,11 @@ sub install {
 
 sub start {
     my $self = shift;
-    my %args = @_;
 
     croak "Ollama is not installed" unless $self->is_installed;
 
     # Check if already running
-    if ( my $status = $self->status ) {
-        return 1 if $status eq 'RUNNING';
-    }
+    return 1 if $self->status eq 'RUNNING';
 
     # Start ollama serve in background
     my $pid = fork();
@@ -154,17 +154,11 @@ sub start {
     if ( $pid == 0 ) {
 
         # Child process
-        setsid();
         exec( $self->{ollama_path}, 'serve' );
+        exit 1;    # Should never reach here
     }
 
-    # Parent process
-    # Store PID
-    open( my $fh, '>', $self->{config}{pid_file} ) or croak "Failed to write PID file: $!";
-    print $fh $pid;
-    close $fh;
-
-    # Wait a bit and verify process started
+    # Parent process - wait a bit and verify process started
     sleep 1;
     return $self->status eq 'RUNNING';
 }
@@ -175,10 +169,11 @@ sub stop {
 
     croak "Ollama is not installed" unless $self->is_installed;
 
+    # Get running server PID
     my $pid = $self->pid;
     return 1 unless $pid;    # Already stopped
 
-    # Send SIGTERM
+    # Try graceful shutdown first
     kill 'TERM', $pid;
 
     # Wait for process to stop
@@ -187,16 +182,15 @@ sub stop {
     while ( $waited < $timeout ) {
         sleep 1;
         $waited++;
-        return 1 unless kill 0, $pid;
+        return 1 unless kill( 0, $pid );
     }
 
-    # If still running, send SIGKILL
-    if ( kill 0, $pid ) {
+    # If still running, force kill
+    if ( kill( 0, $pid ) ) {
         kill 'KILL', $pid;
         carp "Had to forcefully kill Ollama process";
     }
 
-    unlink $self->{config}{pid_file} if -e $self->{config}{pid_file};
     return 1;
 }
 
@@ -205,7 +199,7 @@ sub restart {
     my %args = @_;
 
     return 0 unless $self->stop(%args);
-    return $self->start(%args);
+    return $self->start();
 }
 
 sub status {
@@ -213,25 +207,48 @@ sub status {
 
     croak "Ollama is not installed" unless $self->is_installed;
 
-    my $pid = $self->pid;
-    return 'STOPPED' unless $pid;
+    # Use 'ollama ps' to check running status
+    my ( $stdout, $stderr );
+    if ( run( [ $self->{ollama_path}, 'ps' ], '>', \$stdout, '2>', \$stderr ) ) {
+        return 'RUNNING' if $stdout =~ /ollama serve/;
+    }
 
-    return kill( 0, $pid ) ? 'RUNNING' : 'STOPPED';
+    return 'STOPPED';
 }
 
 sub pid {
     my $self = shift;
 
-    # Check PID file first
-    if ( -e $self->{config}{pid_file} ) {
-        open( my $fh, '<', $self->{config}{pid_file} ) or return undef;
-        my $pid = <$fh>;
-        close $fh;
-        chomp $pid;
-        return $pid if $pid =~ /^\d+$/ && kill( 0, $pid );
+    croak "Ollama is not installed" unless $self->is_installed;
+
+    # Use pgrep to find the server process
+    my $pid = eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;  # 5 second timeout
+        my $result = qx(pgrep -f 'ollama serve');
+        alarm 0;
+        return $result;
+    };
+
+    if ($@) {
+        if ($@ eq "timeout\n") {
+            carp "Timeout while finding Ollama process";
+            return;
+        }
+        carp "Error finding Ollama process: $@";
+        return;
     }
 
-    return undef;
+    chomp $pid;
+    return unless $pid && $pid =~ /^\d+$/;
+
+    # Verify the process is still running and is actually ollama
+    if (kill(0, $pid)) {
+        my $cmd = qx(ps -p $pid -o command=);
+        return $pid if $cmd && $cmd =~ /ollama serve/;
+    }
+
+    return;
 }
 
 1;
@@ -246,9 +263,7 @@ Ollama::Manager - Perl interface for managing Ollama installation and server pro
 
     use Ollama::Manager;
     
-    my $ollama = Ollama::Manager->new(
-        pid_file => '/path/to/ollama.pid'  # Required
-    );
+    my $ollama = Ollama::Manager->new();
     
     # Install Ollama if not present
     if (!$ollama->is_installed) {
@@ -277,21 +292,17 @@ including installation, updates, and controlling the server process.
 
 =item new(%args)
 
-Constructor. Accepts the following arguments:
+Constructor. Accepts the following optional arguments:
 
 =over 4
 
-=item pid_file
-
-Path to the PID file (required). This file is used to track the Ollama server process.
-
 =item ollama_path
 
-Explicit path to the ollama executable (optional).
+Explicit path to the ollama executable.
 
 =item install_url
 
-URL for the Ollama installation script (optional).
+URL for the Ollama installation script.
 
 =back
 
@@ -315,7 +326,7 @@ Force reinstallation even if already installed.
 
 =back
 
-=item start(%args)
+=item start()
 
 Starts the Ollama server process.
 
@@ -337,7 +348,7 @@ Restarts the Ollama server process.
 
 =item status()
 
-Returns the server status: 'RUNNING', 'STOPPED', or 'UNKNOWN'.
+Returns the server status: 'RUNNING' or 'STOPPED'.
 
 =item pid()
 
