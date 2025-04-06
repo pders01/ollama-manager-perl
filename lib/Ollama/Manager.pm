@@ -4,23 +4,22 @@ use strict;
 use warnings;
 use v5.32.0;
 
-use File::Spec;
-use File::Which;
-use POSIX;
-use Carp qw(croak carp);
-use Scalar::Util qw(blessed);
-use Cwd qw(abs_path);
-use HTTP::Tiny;
-use File::Temp qw(tempfile);
-use IPC::Run qw(run);
+use File::Spec  ();
+use File::Which ();
+use POSIX       qw( chmod close exit fork kill open setsid sleep unlink );
+use Carp        qw( carp croak );
+use Cwd         qw( abs_path );
+use HTTP::Tiny  ();
+use File::Temp  qw( tempfile );
+use IPC::Run    qw( run );
 
 # Official URL for the install script
 use constant OLLAMA_INSTALL_URL => 'https://ollama.com/install.sh';
 
 sub new {
     my $class = shift;
-    my %args = @_;
-    my $self = bless {}, $class;
+    my %args  = @_;
+    my $self  = bless {}, $class;
     $self->_initialize(%args);
     return $self;
 }
@@ -28,34 +27,34 @@ sub new {
 sub _initialize {
     my $self = shift;
     my %args = @_;
-    
+
     $self->{config} = {
-        ollama_path => $args{ollama_path}, # Explicit path override
+        ollama_path => $args{ollama_path},    # Explicit path override
         install_url => $args{install_url} || OLLAMA_INSTALL_URL,
-        pid_file    => $args{pid_file} || File::Spec->catfile(File::Spec->tmpdir, 'ollama.pid'),
+        pid_file    => $args{pid_file}    || File::Spec->catfile( File::Spec->tmpdir, 'ollama.pid' ),
     };
-    
+
     $self->_find_ollama();
 }
 
 sub _find_ollama {
     my $self = shift;
-    
+
     # If explicit path provided, use it
-    if (my $path = $self->{config}{ollama_path}) {
-        if (-x $path) {
+    if ( my $path = $self->{config}{ollama_path} ) {
+        if ( -x $path ) {
             $self->{ollama_path} = abs_path($path);
             return $self->{ollama_path};
         }
         carp "Specified ollama path '$path' is not executable";
     }
-    
+
     # Try to find ollama in PATH
-    if (my $path = File::Which::which('ollama')) {
+    if ( my $path = File::Which::which('ollama') ) {
         $self->{ollama_path} = $path;
         return $path;
     }
-    
+
     return undef;
 }
 
@@ -66,55 +65,55 @@ sub is_installed {
 
 sub version {
     my $self = shift;
-    
+
     croak "Ollama is not installed" unless $self->is_installed;
-    
-    my ($stdout, $stderr);
-    if (run([$self->{ollama_path}, '--version'], '>', \$stdout, '2>', \$stderr)) {
+
+    my ( $stdout, $stderr );
+    if ( run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr ) ) {
         chomp $stdout;
         return $stdout;
     }
-    
+
     croak "Failed to get Ollama version: $stderr";
 }
 
 sub install {
     my $self = shift;
     my %args = @_;
-    
+
     # Check platform
-    croak "Installation is only supported on Unix-like systems" 
+    croak "Installation is only supported on Unix-like systems"
         unless $^O =~ /^(linux|darwin|freebsd|netbsd|openbsd)$/;
-    
+
     # If already installed and not forced, return success
-    if ($self->is_installed && !$args{force}) {
+    if ( $self->is_installed && !$args{force} ) {
         carp "Ollama is already installed";
         return 1;
     }
-    
+
     carp "Installation requires appropriate system permissions";
-    
+
     # Fetch install script
-    my $http = HTTP::Tiny->new;
-    my $response = $http->get($self->{config}{install_url});
-    
+    my $http     = HTTP::Tiny->new;
+    my $response = $http->get( $self->{config}{install_url} );
+
     croak "Failed to download install script: $response->{status} $response->{reason}"
         unless $response->{success};
-    
+
     # Create temporary file for script
-    my ($fh, $tempfile) = tempfile();
+    my ( $fh, $tempfile ) = tempfile();
     print $fh $response->{content};
     close $fh;
     chmod 0755, $tempfile;
-    
+
     # Execute install script
-    my ($stdout, $stderr);
-    if (run(['sh', $tempfile], '>', \$stdout, '2>', \$stderr)) {
+    my ( $stdout, $stderr );
+    if ( run( [ 'sh', $tempfile ], '>', \$stdout, '2>', \$stderr ) ) {
         unlink $tempfile;
         $self->_find_ollama();
         return $self->is_installed;
     }
-    
+
     unlink $tempfile;
     croak "Installation failed: $stderr";
 }
@@ -122,31 +121,32 @@ sub install {
 sub start {
     my $self = shift;
     my %args = @_;
-    
+
     croak "Ollama is not installed" unless $self->is_installed;
-    
+
     # Check if already running
-    if (my $status = $self->status) {
+    if ( my $status = $self->status ) {
         return 1 if $status eq 'RUNNING';
     }
-    
+
     # Start ollama serve in background
     my $pid = fork();
     croak "Failed to fork: $!" unless defined $pid;
-    
-    if ($pid == 0) {
+
+    if ( $pid == 0 ) {
+
         # Child process
         setsid();
-        exec($self->{ollama_path}, 'serve');
-        exit 1; # Should never reach here
+        exec( $self->{ollama_path}, 'serve' );
+        exit 1;    # Should never reach here
     }
-    
+
     # Parent process
     # Store PID
-    open(my $fh, '>', $self->{config}{pid_file}) or croak "Failed to write PID file: $!";
+    open( my $fh, '>', $self->{config}{pid_file} ) or croak "Failed to write PID file: $!";
     print $fh $pid;
     close $fh;
-    
+
     # Wait a bit and verify process started
     sleep 1;
     return $self->status eq 'RUNNING';
@@ -155,30 +155,30 @@ sub start {
 sub stop {
     my $self = shift;
     my %args = @_;
-    
+
     croak "Ollama is not installed" unless $self->is_installed;
-    
+
     my $pid = $self->pid;
-    return 1 unless $pid; # Already stopped
-    
+    return 1 unless $pid;    # Already stopped
+
     # Send SIGTERM
     kill 'TERM', $pid;
-    
+
     # Wait for process to stop
     my $timeout = $args{timeout} || 10;
-    my $waited = 0;
-    while ($waited < $timeout) {
+    my $waited  = 0;
+    while ( $waited < $timeout ) {
         sleep 1;
         $waited++;
         return 1 unless kill 0, $pid;
     }
-    
+
     # If still running, send SIGKILL
-    if (kill 0, $pid) {
+    if ( kill 0, $pid ) {
         kill 'KILL', $pid;
         carp "Had to forcefully kill Ollama process";
     }
-    
+
     unlink $self->{config}{pid_file} if -e $self->{config}{pid_file};
     return 1;
 }
@@ -186,34 +186,34 @@ sub stop {
 sub restart {
     my $self = shift;
     my %args = @_;
-    
+
     return 0 unless $self->stop(%args);
     return $self->start(%args);
 }
 
 sub status {
     my $self = shift;
-    
+
     croak "Ollama is not installed" unless $self->is_installed;
-    
+
     my $pid = $self->pid;
     return 'STOPPED' unless $pid;
-    
-    return kill(0, $pid) ? 'RUNNING' : 'STOPPED';
+
+    return kill( 0, $pid ) ? 'RUNNING' : 'STOPPED';
 }
 
 sub pid {
     my $self = shift;
-    
+
     # Check PID file first
-    if (-e $self->{config}{pid_file}) {
-        open(my $fh, '<', $self->{config}{pid_file}) or return undef;
+    if ( -e $self->{config}{pid_file} ) {
+        open( my $fh, '<', $self->{config}{pid_file} ) or return undef;
         my $pid = <$fh>;
         close $fh;
         chomp $pid;
-        return $pid if $pid =~ /^\d+$/ && kill(0, $pid);
+        return $pid if $pid =~ /^\d+$/ && kill( 0, $pid );
     }
-    
+
     return undef;
 }
 
