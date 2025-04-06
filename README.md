@@ -107,4 +107,9 @@ This library is free software; you can redistribute it and/or modify it under th
 
 ## Author
 
-Your Name <your.email@example.com> 
+Paul Derscheid <me@paulderscheid.xyz>
+
+## Disclosure
+
+This library was basically one shot by Cursor with my guidance while using auto selection of models.
+Keep that in mind. For more details check [DESIGN.md](DESIGN.md).
