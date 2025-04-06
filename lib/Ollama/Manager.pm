@@ -138,7 +138,6 @@ sub start {
         # Child process
         setsid();
         exec( $self->{ollama_path}, 'serve' );
-        exit 1;    # Should never reach here
     }
 
     # Parent process
