@@ -7,6 +7,8 @@ use Time::HiRes qw( time );
 # Timeout for process-related operations (in seconds)
 use constant TIMEOUT => 5;
 
+# Docker context install logic removed: now handled in Dockerfile
+
 BEGIN {
     use_ok('Ollama::Manager');
 }
@@ -17,9 +19,9 @@ sub find_ollama_process {
     my $pid;
     
     while (time - $start_time < TIMEOUT) {
-        $pid = qx(pgrep -f 'ollama serve');
-        chomp $pid;
-        return $pid if $pid && kill( 0, $pid );
+        my $pids = qx(pgrep -f 'ollama serve');
+        ($pid) = $pids =~ /^(\\d+)/m;  # get the first numeric PID from output
+        return $pid if defined $pid && $pid =~ /^\\d+$/ && kill(0, $pid);
         sleep 0.1;
     }
     

@@ -69,25 +69,25 @@ sub version {
     my ( $stdout, $stderr );
     my $success = eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
-        alarm 5;  # 5 second timeout
+        alarm 5;    # 5 second timeout
         my $result = run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr );
         alarm 0;
         return $result;
     };
 
     if ($@) {
-        if ($@ eq "timeout\n") {
+        if ( $@ eq "timeout\n" ) {
             croak "Timeout while getting Ollama version";
         }
         croak "Failed to execute ollama --version: $@";
     }
 
-    if (!$success) {
+    if ( !$success ) {
         croak "Failed to get Ollama version: $stderr";
     }
 
     chomp $stdout;
-    return $stdout if !$stdout;  # Return empty string if no output
+    return $stdout if !$stdout;    # Return empty string if no output
 
     # Extract version number from output
     if ( $stdout =~ /^ollama version is (\d+\.\d+\.\d+)/ ) {
@@ -224,14 +224,14 @@ sub pid {
     # Use pgrep to find the server process
     my $pid = eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
-        alarm 5;  # 5 second timeout
+        alarm 5;    # 5 second timeout
         my $result = qx(pgrep -f 'ollama serve');
         alarm 0;
         return $result;
     };
 
     if ($@) {
-        if ($@ eq "timeout\n") {
+        if ( $@ eq "timeout\n" ) {
             carp "Timeout while finding Ollama process";
             return;
         }
@@ -243,12 +243,145 @@ sub pid {
     return unless $pid && $pid =~ /^\d+$/;
 
     # Verify the process is still running and is actually ollama
-    if (kill(0, $pid)) {
+    if ( kill( 0, $pid ) ) {
         my $cmd = qx(ps -p $pid -o command=);
         return $pid if $cmd && $cmd =~ /ollama serve/;
     }
 
     return;
+}
+
+# Additional Ollama CLI Methods
+
+sub create {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'create' );
+    CORE::push @cmd, $args{modelfile}       if $args{modelfile};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to create model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub show {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'show' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to show model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub run_model {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'run' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to run model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub stop_model {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'stop' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to stop model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub pull {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'pull' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to pull model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub push {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'push' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to push model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub list {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'list' );
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to list models: $stderr" unless $success;
+    return $stdout;
+}
+
+sub ps {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'ps' );
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to list running models: $stderr" unless $success;
+    return $stdout;
+}
+
+sub cp {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'cp' );
+    CORE::push @cmd, $args{src}             if $args{src};
+    CORE::push @cmd, $args{dest}            if $args{dest};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to copy model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub rm {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'rm' );
+    CORE::push @cmd, $args{model}           if $args{model};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to remove model: $stderr" unless $success;
+    return $stdout;
+}
+
+sub help {
+    my ( $self, %args ) = @_;
+    croak "Ollama is not installed" unless $self->is_installed;
+    my @cmd = ( $self->{ollama_path}, 'help' );
+    CORE::push @cmd, $args{command}         if $args{command};
+    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
+    my ( $stdout, $stderr );
+    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
+    croak "Failed to get help: $stderr" unless $success;
+    return $stdout;
 }
 
 1;
@@ -353,6 +486,178 @@ Returns the server status: 'RUNNING' or 'STOPPED'.
 =item pid()
 
 Returns the PID of the running Ollama server process, or undef if not running.
+
+=item create(%args)
+
+Creates a new model. Accepts:
+
+=over 4
+
+=item modelfile
+
+Path to the model file.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'create' command.
+
+=back
+
+=item show(%args)
+
+Displays information about a model. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to show.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'show' command.
+
+=back
+
+=item run_model(%args)
+
+Runs a model. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to run.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'run' command.
+
+=back
+
+=item stop_model(%args)
+
+Stops a running model. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to stop.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'stop' command.
+
+=back
+
+=item pull(%args)
+
+Pulls a model from a repository. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to pull.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'pull' command.
+
+=back
+
+=item push(%args)
+
+Pushes a model to a repository. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to push.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'push' command.
+
+=back
+
+=item list(%args)
+
+Lists available models. Accepts:
+
+=over 4
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'list' command.
+
+=back
+
+=item ps(%args)
+
+Lists running models. Accepts:
+
+=over 4
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'ps' command.
+
+=back
+
+=item cp(%args)
+
+Copies a model. Accepts:
+
+=over 4
+
+=item src
+
+Source model name.
+
+=item dest
+
+Destination model name.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'cp' command.
+
+=back
+
+=item rm(%args)
+
+Removes a model. Accepts:
+
+=over 4
+
+=item model
+
+Name of the model to remove.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'rm' command.
+
+=back
+
+=item help(%args)
+
+Displays help for a command. Accepts:
+
+=over 4
+
+=item command
+
+Name of the command to display help for.
+
+=item extra_args
+
+Array reference of additional arguments to pass to the 'help' command.
+
+=back
 
 =back
 
