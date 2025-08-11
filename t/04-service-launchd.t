@@ -1,43 +1,45 @@
 use strict;
 use warnings;
-use Test::More;
-use Test::Exception;
+use Test::More import => [qw( done_testing is ok skip )];
+use Test::Exception ();
 
 use lib 'lib';
-use Ollama::Service::Launchd;
+use Ollama::Service::Launchd ();
 
 {
+
     package DummyMgrL;
     sub new { bless { calls => [] }, shift }
+
     sub _run_cmd {
-        my ($self, $cmd, %opts) = @_;
-        push @{ $self->{calls} }, [ @$cmd ];
+        my ( $self, $cmd, %opts ) = @_;
+        push @{ $self->{calls} }, [@$cmd];
         my $joined = join ' ', @$cmd;
-        if ($joined =~ /^launchctl kickstart -k /) {
-            return (1, '', '');
+        if ( $joined =~ /^launchctl kickstart -k / ) {
+            return ( 1, '', '' );
         }
-        if ($joined =~ /^launchctl stop /) {
-            return (1, '', '');
+        if ( $joined =~ /^launchctl stop / ) {
+            return ( 1, '', '' );
         }
-        if ($joined =~ /^launchctl print /) {
+        if ( $joined =~ /^launchctl print / ) {
             my $state = $self->{state} // 'inactive';
             my $pid   = defined $self->{pid} ? $self->{pid} : 0;
-            my $out = "state = $state\n";
-            $out   .= "pid = $pid\n" if $state eq 'running';
-            return (1, $out, '');
+            my $out   = "state = $state\n";
+            $out .= "pid = $pid\n" if $state eq 'running';
+            return ( 1, $out, '' );
         }
-        return (0, '', 'unknown command');
+        return ( 0, '', 'unknown command' );
     }
-    sub calls { shift->{calls} }
+    sub calls     { shift->{calls} }
     sub set_state { $_[0]->{state} = $_[1] }
     sub set_pid   { $_[0]->{pid}   = $_[1] }
 }
 
 my $mgr = DummyMgrL->new;
-my $svc = Ollama::Service::Launchd->new(label => 'com.ollama.ollama', scope => 'gui', uid => 501);
+my $svc = Ollama::Service::Launchd->new( label => 'com.ollama.ollama', scope => 'gui', uid => 501 );
 
 lives_ok { $svc->start($mgr) } 'launchd kickstart ok';
-lives_ok { $svc->stop($mgr) }  'launchd stop ok';
+lives_ok { $svc->stop($mgr) } 'launchd stop ok';
 
 $mgr->set_state('running');
 is( $svc->status($mgr), 'RUNNING', 'status RUNNING when running' );
@@ -54,9 +56,9 @@ ok( !defined $svc->pid($mgr), 'pid undef when inactive' );
 SKIP: {
     skip 'macOS launchd test skipped (set OLLAMA_TEST_LAUNCHD=1)', 2 unless $^O eq 'darwin' && $ENV{OLLAMA_TEST_LAUNCHD};
     my $real_mgr = DummyMgrL->new;
-    my $real = Ollama::Service::Launchd->new(label => 'com.ollama.ollama', scope => 'gui');
+    my $real     = Ollama::Service::Launchd->new( label => 'com.ollama.ollama', scope => 'gui' );
     lives_ok { $real->status($real_mgr) } 'launchd status (real) lives';
-    lives_ok { $real->pid($real_mgr) }    'launchd pid (real) lives';
+    lives_ok { $real->pid($real_mgr) } 'launchd pid (real) lives';
 }
 
 done_testing();
