@@ -1,6 +1,6 @@
 use strict;
 use warnings;
-use Test::More import => [qw( done_testing is ok skip is lives_ok )];
+use Test::More import => [qw( done_testing is ok skip is )];
 
 use lib 'lib';
 use Ollama::Service::Launchd ();
@@ -37,8 +37,8 @@ use Ollama::Service::Launchd ();
 my $mgr = DummyMgrL->new;
 my $svc = Ollama::Service::Launchd->new( label => 'com.ollama.ollama', scope => 'gui', uid => 501 );
 
-lives_ok { $svc->start($mgr) } 'launchd kickstart ok';
-lives_ok { $svc->stop($mgr) } 'launchd stop ok';
+ok( eval { $svc->start($mgr); 1 }, 'launchd kickstart ok' );
+ok( eval { $svc->stop($mgr); 1 },  'launchd stop ok' );
 
 $mgr->set_state('running');
 is( $svc->status($mgr), 'RUNNING', 'status RUNNING when running' );
@@ -56,8 +56,8 @@ SKIP: {
     skip 'macOS launchd test skipped (set OLLAMA_TEST_LAUNCHD=1)', 2 unless $^O eq 'darwin' && $ENV{OLLAMA_TEST_LAUNCHD};
     my $real_mgr = DummyMgrL->new;
     my $real     = Ollama::Service::Launchd->new( label => 'com.ollama.ollama', scope => 'gui' );
-    lives_ok { $real->status($real_mgr) } 'launchd status (real) lives';
-    lives_ok { $real->pid($real_mgr) } 'launchd pid (real) lives';
+    ok( eval { $real->status($real_mgr); 1 }, 'launchd status (real) lives' );
+    ok( eval { $real->pid($real_mgr); 1 },    'launchd pid (real) lives' );
 }
 
 done_testing();
