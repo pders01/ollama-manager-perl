@@ -51,6 +51,22 @@ if ($ollama->status eq 'RUNNING') {
 $ollama->stop();
 ```
 
+### Integrating with Ollama::Client
+
+Pair `Ollama::Manager` with `Ollama::Client` to ensure the daemon is running before issuing API calls.
+
+```perl
+use Ollama::Manager ();
+use Ollama::Client  ();
+
+my $mgr = Ollama::Manager->new();
+$mgr->start() if $mgr->status ne 'RUNNING';
+
+my $client = Ollama::Client->new();
+my $res = $client->generate(model => 'gemma3:latest', prompt => 'Say hello');
+print $res->{response},"\n" if $res;
+```
+
 ### Methods
 
 - `new(%args)`

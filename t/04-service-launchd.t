@@ -1,7 +1,6 @@
 use strict;
 use warnings;
-use Test::More import => [qw( done_testing is ok skip )];
-use Test::Exception ();
+use Test::More import => [qw( done_testing is ok skip is lives_ok )];
 
 use lib 'lib';
 use Ollama::Service::Launchd ();
