@@ -2,132 +2,194 @@
 
 use strict;
 use warnings;
-use v5.32.0;
+use 5.032000;
 
 use FindBin ();
-use lib "$FindBin::Bin/../lib"; # Find Ollama::Manager relative to script
+use lib "$FindBin::Bin/../lib";    # Find Ollama::Manager relative to script
 
+use Carp         qw( croak );
 use Getopt::Long qw( GetOptions );
-use Pod::Usage qw( pod2usage );
-use Try::Tiny qw( catch try );
-use Ollama::Manager ();
+use Pod::Usage   qw( pod2usage );
+use Try::Tiny    qw( catch try );
+use English      qw( -no_match_vars );
 
-Getopt::Long::Configure('pass_through'); # Stop option processing at the first non-option
+use Ollama::Manager          ();
+use Ollama::Service::Launchd ();    # macOS
+use Ollama::Service::Systemd ();    # Linux
 
-my %opts;
-my @cli_args = @ARGV;
+Getopt::Long::Configure('pass_through');    # Stop option processing at the first non-option
 
-# --- Parse Global Options --- 
-# Use GetOptions directly on the argument array
-my $ok = GetOptions(
-    \%opts,             # Hash to store results
-    'ollama-path=s',    # --ollama-path PATH
-    'help|h|?',         # -h, -?, --help
-    'man',              # --man
-);
+sub build_service_adapter {
+    my ($opts) = @_;
+    my $choice = $opts->{service} // 'auto';
 
-# Exit if option parsing failed
-if (!$ok) {
-    pod2usage(-exitval => 2);
+    if ( $choice eq 'none' ) {
+        return;
+    }
+
+    if ( $choice eq 'launchd' || ( $choice eq 'auto' && $OSNAME eq 'darwin' ) ) {
+        my $scope = $opts->{'launchd-scope'} // 'gui';
+        my $label = $opts->{'launchd-label'} // 'com.ollama.ollama';
+        return Ollama::Service::Launchd->new( scope => $scope, label => $label );
+    }
+
+    if ( $choice eq 'systemd' || ( $choice eq 'auto' && $OSNAME ne 'darwin' ) ) {
+        my $scope = $opts->{'systemd-scope'} // 'user';
+        my $unit  = $opts->{'systemd-unit'}  // 'ollama';
+        return Ollama::Service::Systemd->new( scope => $scope, unit => $unit );
+    }
+
+    return;
 }
 
-# Handle help options immediately
-pod2usage(-exitval => 0, -verbose => 1) if $opts{help};
-pod2usage(-exitval => 0, -verbose => 2) if $opts{man};
+sub main {
+    my %opts;
 
-# The command should be the first remaining argument in @cli_args
-my $command = shift @cli_args || '';
-
-# --- Instantiate Manager --- 
-my $manager = try {
-    Ollama::Manager->new(
-        ollama_path => $opts{'ollama-path'}, # Pass the parsed option
+    my $ok = GetOptions(
+        \%opts,
+        'ollama-path=s',      # --ollama-path PATH
+        'no-http-health!',    # --no-http-health (disable HTTP health checks)
+        'service=s',          # --service auto|launchd|systemd|none
+        'systemd-scope=s',    # --systemd-scope user|system
+        'launchd-scope=s',    # --launchd-scope gui|system
+        'systemd-unit=s',     # --systemd-unit UNIT
+        'launchd-label=s',    # --launchd-label LABEL
+        'help|h|?',           # -h, -?, --help
+        'man',                # --man
     );
-} catch {
-    chomp;
-    die "Failed to initialize Ollama::Manager: $_\n";
-};
 
-# --- Parse Command-Specific Options & Dispatch ---
-my $output = ''; # Declare output variable here
+    if ( !$ok ) {
+        pod2usage( -exitval => 2 );
+    }
 
-try {
-    if ( ! $command ) {
-        pod2usage(-message => "Error: No command specified.", -exitval => 2);
+    if ( $opts{'no-http-health'} ) {
+        $ENV{OLLAMA_MANAGER_DISABLE_HTTP} = 1;
     }
-    elsif ( $command eq 'list' ) {
-        # No specific opts for list currently
-        $output = $manager->list();
+
+    if ( $opts{help} ) {
+        pod2usage( -exitval => 0, -verbose => 1 );
     }
-    elsif ( $command eq 'ps' ) {
-        # No specific opts for ps currently
-        $output = $manager->ps();
+    elsif ( $opts{man} ) {
+        pod2usage( -exitval => 0, -verbose => 2 );
     }
-    elsif ( $command eq 'version' ) {
-        my $version = $manager->version();
-        $output = "Ollama version: $version\n";
+
+    # After GetOptions, @ARGV contains the command and its args
+    my @cli_args = @ARGV;
+    my $command  = shift @cli_args || q{};
+
+    my $manager = try {
+        Ollama::Manager->new( ollama_path => $opts{'ollama-path'}, );
     }
-    elsif ( $command eq 'is-installed' ) {
-        $output = $manager->is_installed ? "Ollama is installed.\n" : "Ollama is NOT installed.\n";
+    catch {
+        chomp;
+        die "Failed to initialize Ollama::Manager: $_\n";
+    };
+
+    my $service = build_service_adapter( \%opts );
+
+    my $output = q{};
+
+    my %dispatch = (
+        list   => sub { $output = $manager->list() },
+        ps     => sub { $output = $manager->ps() },
+        status => sub {
+            my $status = $manager->status();
+            if ( $status ne 'RUNNING' && $service ) {
+                $status = $service->status($manager);
+            }
+            $output = $status . "\n";
+        },
+        pid => sub {
+            my $pid = $manager->pid();
+            if ( !defined $pid && $service ) {
+                $pid = $service->pid($manager);
+            }
+            $output = defined $pid ? "$pid\n" : "\n";
+        },
+        version => sub {
+            my $version = $manager->version();
+            $output = "Ollama version: $version\n";
+        },
+        'is-installed' => sub {
+            $output = $manager->is_installed ? "Ollama is installed.\n" : "Ollama is NOT installed.\n";
+        },
+        'start-server' => sub {
+            if   ($service) { $service->start($manager) }
+            else            { $manager->start() }
+            $output = "Ollama server start requested.\n";
+        },
+        'stop-server' => sub {
+            if   ($service) { $service->stop($manager) }
+            else            { $manager->stop() }
+            $output = "Ollama server stop requested.\n";
+        },
+        pull => sub {
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for pull command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->pull( model => $model_name, extra_args => [@cli_args] );
+        },
+        push => sub {
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for push command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->push( model => $model_name, extra_args => [@cli_args] );
+        },
+        show => sub {
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for show command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->show( model => $model_name, extra_args => [@cli_args] );
+        },
+        run => sub {    # Map 'run' command to run_model method
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for run command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->run_model( model => $model_name, extra_args => [@cli_args] );
+        },
+        stop => sub {    # Map 'stop' command to stop_model method
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for stop command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->stop_model( model => $model_name, extra_args => [@cli_args] );
+        },
+        create => sub {
+            my $model_name = shift @cli_args
+                or pod2usage(
+                -message => 'Error: Missing modelfile path/name for create command.',
+                -exitval => 2,
+                -verbose => 0
+                );
+            $output = $manager->create( modelfile => $model_name, extra_args => [@cli_args] );
+        },
+        cp => sub {
+            my $src = shift @cli_args
+                or pod2usage( -message => 'Error: Missing source model for cp command.', -exitval => 2, -verbose => 0 );
+            my $dest = shift @cli_args
+                or pod2usage( -message => 'Error: Missing destination model for cp command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->cp( src => $src, dest => $dest, extra_args => [@cli_args] );
+        },
+        rm => sub {
+            my $model_name = shift @cli_args
+                or pod2usage( -message => 'Error: Missing model name for rm command.', -exitval => 2, -verbose => 0 );
+            $output = $manager->rm( model => $model_name, extra_args => [@cli_args] );
+        },
+        help => sub {
+            $output = $manager->help( command => shift @cli_args, extra_args => [@cli_args] );
+        },
+    );
+
+    try {
+        if ( !$command || !exists $dispatch{$command} ) {
+            pod2usage( -message => "Error: Unknown or missing command '$command'.", -exitval => 2 );
+        }
+        $dispatch{$command}->();
     }
-    elsif ( $command eq 'start-server' ) {
-        $manager->start();
-        $output = "Ollama server start requested.\n";
-    }
-    elsif ( $command eq 'stop-server' ) {
-        $manager->stop();
-        $output = "Ollama server stop requested.\n";
-    }
-    elsif ( $command eq 'pull' ) {
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for pull command.", -exitval => 2, -verbose => 0);
-        $output = $manager->pull(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'push' ) {
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for push command.", -exitval => 2, -verbose => 0);
-        $output = $manager->push(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'show' ) {
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for show command.", -exitval => 2, -verbose => 0);
-        $output = $manager->show(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'run' ) { # Map 'run' command to run_model method
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for run command.", -exitval => 2, -verbose => 0);
-        $output = $manager->run_model(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'stop' ) { # Map 'stop' command to stop_model method
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for stop command.", -exitval => 2, -verbose => 0);
-        $output = $manager->stop_model(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'create' ) {
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing modelfile path/name for create command.", -exitval => 2, -verbose => 0);
-        $output = $manager->create(modelfile => $model_name, extra_args => [@cli_args]); # Assuming first arg is modelfile path
-    }
-    elsif ( $command eq 'cp' ) {
-        my $src = shift @cli_args or pod2usage(-message => "Error: Missing source model for cp command.", -exitval => 2, -verbose => 0);
-        my $dest = shift @cli_args or pod2usage(-message => "Error: Missing destination model for cp command.", -exitval => 2, -verbose => 0);
-        $output = $manager->cp(src => $src, dest => $dest, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'rm' ) {
-        my $model_name = shift @cli_args or pod2usage(-message => "Error: Missing model name for rm command.", -exitval => 2, -verbose => 0);
-        $output = $manager->rm(model => $model_name, extra_args => [@cli_args]);
-    }
-    elsif ( $command eq 'help' ) {
-         # Pass remaining args to the help command (e.g., help pull)
-        $output = $manager->help(command => shift @cli_args, extra_args => [@cli_args]);
-    }
-    else {
-        pod2usage(-message => "Error: Unknown command '$command'.", -exitval => 2);
-    }
+    catch {
+        chomp;
+        die "Error executing command '$command': $_\n";
+    };
+
+    print $output or croak 'Failed to print output';
+    return 0;
 }
-catch {
-    chomp;
-    die "Error executing command '$command': $_\n";
-};
 
-# --- Output Result ---
-print $output;
-
-exit 0;
+exit main();
 
 __END__
 
@@ -140,97 +202,38 @@ ollama-manager-cli - Command-line interface for Ollama::Manager
 ollama-manager-cli [global options] <command> [command arguments...]
 
  Global Options:
-   --ollama-path PATH  Specify the path to the ollama binary
-   --help, -h, -?      Show brief help message
-   --man               Show full documentation
+   --ollama-path PATH    Specify the path to the ollama binary
+   --no-http-health      Disable HTTP health checks in status detection
+   --service NAME        Choose service adapter: auto (default), launchd, systemd, none
+   --systemd-scope S     systemd scope: user (default) or system
+   --systemd-unit U      systemd unit name (default: ollama)
+   --launchd-scope S     launchd scope: gui (default) or system
+   --launchd-label L     launchd label (default: com.ollama.ollama)
+   --help, -h, -?        Show brief help message
+   --man                 Show full documentation
 
  Commands:
-   list                List locally available models
-   ps                  List running models
-   version             Show the installed Ollama version
-   is-installed        Check if Ollama executable is found
-   start-server        Start the Ollama background server
-   stop-server         Stop the Ollama background server
-   pull MODEL [args..] Pull a model
-   push MODEL [args..] Push a model
-   show MODEL [args..] Show model details
-   run MODEL [args..]  Run a model
-   stop MODEL [args..] Stop a running model
+   list                 List locally available models
+   ps                   List running models
+   status               Show server status (RUNNING/STOPPED)
+   pid                  Print server PID (empty if not found)
+   version              Show the installed Ollama version
+   is-installed         Check if Ollama executable is found
+   start-server         Start the Ollama background server (via service if available)
+   stop-server          Stop the Ollama background server (via service if available)
+   pull MODEL [args..]  Pull a model
+   push MODEL [args..]  Push a model
+   show MODEL [args..]  Show model details
+   run MODEL [args..]   Run a model
+   stop MODEL [args..]  Stop a running model
    create MODELFILE [args..] Create a model from a Modelfile
    cp SRC DEST [args..] Copy a model
-   rm MODEL [args..]   Remove a model
-   help [COMMAND]      Show help for ollama CLI, optionally for a specific command
+   rm MODEL [args..]    Remove a model
+   help [COMMAND]       Show help for ollama CLI, optionally for a specific command
 
 =head1 DESCRIPTION
 
-This script provides a command-line interface to the functionality
-offered by the Ollama::Manager Perl module, wrapping the underlying
-`ollama` executable commands.
-
-=head1 COMMANDS
-
-=over 4
-
-=item list
-
-Lists models that are available locally.
-
-=item ps
-
-Lists models that are currently running or being served.
-
-=item version
-
-Prints the version of the installed Ollama application.
-
-=item is-installed
-
-Checks if the Ollama executable can be found (either in PATH or via --ollama-path).
-
-=item start-server
-
-Attempts to start the Ollama server process in the background.
-
-=item stop-server
-
-Attempts to stop the Ollama server process.
-
-=item pull MODEL [args...]
-
-Pulls the specified MODEL from the registry. Additional arguments are passed to the `ollama pull` command.
-
-=item push MODEL [args...]
-
-Pushes the specified MODEL to the registry. Additional arguments are passed to the `ollama push` command.
-
-=item show MODEL [args...]
-
-Shows details for the specified MODEL. Additional arguments are passed to the `ollama show` command.
-
-=item run MODEL [args...]
-
-Runs the specified MODEL. Additional arguments are passed to the `ollama run` command.
-
-=item stop MODEL [args...]
-
-Stops the specified running MODEL. Additional arguments are passed to the `ollama stop` command.
-
-=item create MODELFILE [args...]
-
-Creates a model using the specified MODELFILE path. Additional arguments are passed to the `ollama create` command.
-
-=item cp SRC DEST [args...]
-
-Copies model SRC to DEST. Additional arguments are passed to the `ollama cp` command.
-
-=item rm MODEL [args...]
-
-Removes the specified MODEL. Additional arguments are passed to the `ollama rm` command.
-
-=item help [COMMAND]
-
-Displays help information from the underlying `ollama` executable. If COMMAND is specified, shows help for that specific command.
-
-=back
+This script provides a command-line interface to Ollama::Manager with optional
+service-manager integration (launchd/systemd) for start/stop/status/pid.
 
 =cut

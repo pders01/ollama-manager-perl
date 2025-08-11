@@ -2,43 +2,53 @@ package Ollama::Manager;
 
 use strict;
 use warnings;
-use v5.32.0;
+use 5.032000;
 
-use File::Which ();
-use POSIX       qw( kill );
-use Carp        qw( carp croak );
-use Cwd         qw( abs_path );
-use HTTP::Tiny  ();
-use File::Temp  qw( tempfile );
-use IPC::Run    qw( run );
+our $VERSION = '0.1.0';
+
+use File::Which     ();
+use POSIX           qw( kill );
+use Carp            qw( carp croak );
+use Cwd             qw( abs_path );
+use HTTP::Tiny      ();
+use File::Temp      qw( tempfile );
+use Const::Fast     qw( const );
+use English         qw( -no_match_vars );
+use System::Command ();
+use IO::Select      ();
 
 # Official URL for the install script
-use constant OLLAMA_INSTALL_URL => 'https://ollama.com/install.sh';
+const my $OLLAMA_INSTALL_URL  => 'https://ollama.com/install.sh';
+const my $DEFAULT_CMD_TIMEOUT => 5;
+const my $INSTALL_TIMEOUT     => 600;
+const my $LISTEN_PORT         => 11_434;
+const my $EXIT_CODE_SHIFT     => 8;
+const my $FILE_PERMS          => 0o755;
+const my $TIMEOUT_SECONDS     => 10;
+const my $BUFFER_SIZE         => 8192;
 
 sub new {
-    my $class = shift;
-    my %args  = @_;
-    my $self  = bless {}, $class;
+    my ( $class, %args ) = @_;
+    my $self = bless {}, $class;
     $self->_initialize(%args);
     return $self;
 }
 
 sub _initialize {
-    my $self = shift;
-    my %args = @_;
+    my ( $self, %args ) = @_;
 
     $self->{config} = {
-        ollama_path => $args{ollama_path},                         # Explicit path override
-        install_url => $args{install_url} || OLLAMA_INSTALL_URL,
+        ollama_path => $args{ollama_path},
+        install_url => $args{install_url} || $OLLAMA_INSTALL_URL,
     };
 
     $self->_find_ollama();
+    return;
 }
 
 sub _find_ollama {
     my $self = shift;
 
-    # If explicit path provided, use it
     if ( my $path = $self->{config}{ollama_path} ) {
         if ( -x $path ) {
             $self->{ollama_path} = abs_path($path);
@@ -47,13 +57,12 @@ sub _find_ollama {
         carp "Specified ollama path '$path' is not executable";
     }
 
-    # Try to find ollama in PATH
     if ( my $path = File::Which::which('ollama') ) {
         $self->{ollama_path} = $path;
         return $path;
     }
 
-    return undef;
+    return;
 }
 
 sub is_installed {
@@ -61,327 +70,384 @@ sub is_installed {
     return defined $self->{ollama_path};
 }
 
+sub _run_cmd {
+    my ( $self, $cmd_aryref, %opts ) = @_;
+    my $timeout_seconds = $opts{timeout} // $DEFAULT_CMD_TIMEOUT;
+
+    my $cmd;
+    eval { $cmd = System::Command->new( @{$cmd_aryref} ); 1 } or return ( 0, q{}, "exec error: $EVAL_ERROR" );
+
+    my $sel = IO::Select->new();
+    $sel->add( $cmd->stdout );
+    $sel->add( $cmd->stderr );
+
+    my $out      = q{};
+    my $err      = q{};
+    my $end_time = time + $timeout_seconds;
+
+    while (1) {
+        last if $cmd->is_terminated;
+        my $remaining = $end_time - time;
+        if ( $remaining <= 0 ) {
+            $cmd->signal('KILL');
+            $cmd->close();
+            return ( 0, $out, $err, 1 );
+        }
+        my @ready = $sel->can_read($remaining);
+        for my $fh (@ready) {
+            my $buffer;
+            my $read = sysread $fh, $buffer, $BUFFER_SIZE;
+            if ( defined $read && $read > 0 ) {
+                if ( fileno($fh) == fileno $cmd->stdout ) {
+                    $out .= $buffer;
+                }
+                else {
+                    $err .= $buffer;
+                }
+            }
+            else {
+                $sel->remove($fh);
+                close $fh or croak "Failed to close handle: $EVAL_ERROR";
+            }
+        }
+        last if $sel->count == 0;
+    }
+
+    my $exit = $cmd->exit();
+    $cmd->close();
+    my $success = ( defined $exit && $exit == 0 ) ? 1 : 0;
+    return ( $success, $out, $err, 0 );
+}
+
 sub version {
     my $self = shift;
 
-    croak "Ollama is not installed" unless $self->is_installed;
-
-    my ( $stdout, $stderr );
-    my $success = eval {
-        local $SIG{ALRM} = sub { die "timeout\n" };
-        alarm 5;    # 5 second timeout
-        my $result = run( [ $self->{ollama_path}, '--version' ], '>', \$stdout, '2>', \$stderr );
-        alarm 0;
-        return $result;
-    };
-
-    if ($@) {
-        if ( $@ eq "timeout\n" ) {
-            croak "Timeout while getting Ollama version";
-        }
-        croak "Failed to execute ollama --version: $@";
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
     }
 
-    if ( !$success ) {
+    my ( $ok, $stdout, $stderr, $timed_out )
+        = $self->_run_cmd( [ $self->{ollama_path}, '--version' ], timeout => $DEFAULT_CMD_TIMEOUT );
+
+    if ($timed_out) {
+        croak 'Timeout while getting Ollama version';
+    }
+    if ( !$ok ) {
         croak "Failed to get Ollama version: $stderr";
     }
 
     chomp $stdout;
-    return $stdout if !$stdout;    # Return empty string if no output
+    if ( !$stdout ) {
+        return;
+    }
 
-    # Extract version number from output
-    if ( $stdout =~ /^ollama version is (\d+\.\d+\.\d+)/ ) {
+    if ( $stdout =~ /^ollama\s+version\s+is\s+(\d+[.]\d+[.]\d+)/xms ) {
         return $1;
     }
 
-    # If we can't parse the version, return the raw output
     return $stdout;
 }
 
 sub install {
-    my $self = shift;
-    my %args = @_;
+    my ( $self, %args ) = @_;
 
-    # Check platform
-    croak "Installation is only supported on Unix-like systems"
-        unless $^O =~ /^(linux|darwin|freebsd|netbsd|openbsd)$/;
-
-    # If already installed and not forced, return success
-    if ( $self->is_installed && !$args{force} ) {
-        carp "Ollama is already installed";
-        return 1;
+    if ( $OSNAME !~ /linux|darwin|freebsd|netbsd|openbsd/xms ) {
+        croak 'Installation is only supported on Unix-like systems';
     }
 
-    carp "Installation requires appropriate system permissions";
+    if ( $self->is_installed && !$args{force} ) {
+        carp 'Ollama is already installed';
+        return;
+    }
 
-    # Fetch install script
+    carp 'Installation requires appropriate system permissions';
+
     my $http     = HTTP::Tiny->new;
     my $response = $http->get( $self->{config}{install_url} );
 
-    croak "Failed to download install script: $response->{status} $response->{reason}"
-        unless $response->{success};
-
-    # Create temporary file for script
-    my ( $fh, $tempfile ) = tempfile();
-    print $fh $response->{content};
-    close $fh;
-    chmod 0755, $tempfile;
-
-    # Execute install script
-    my ( $stdout, $stderr );
-    if ( run( [ 'sh', $tempfile ], '>', \$stdout, '2>', \$stderr ) ) {
-        unlink $tempfile;
-        $self->_find_ollama();
-        return $self->is_installed;
+    if ( !$response->{success} ) {
+        croak "Failed to download install script: $response->{status} $response->{reason}";
     }
 
+    my ( $fh, $tempfile ) = tempfile();
+    my $printed = print {$fh} $response->{content};
+    if ( !$printed ) {
+        close $fh or croak 'Failed to write install script to temp file';
+    }
+    my $closed = close $fh or croak 'Failed to close install script temp file handle';
+    if ( !$closed ) {
+        croak 'Failed to close install script temp file handle';
+    }
+    chmod $FILE_PERMS, $tempfile;
+
+    my ( $ok, undef, $stderr, $timed_out )
+        = $self->_run_cmd( [ 'sh', $tempfile ], timeout => ( $args{timeout} // $INSTALL_TIMEOUT ) );
     unlink $tempfile;
-    croak "Installation failed: $stderr";
+
+    if ($timed_out) {
+        croak 'Installation timed out';
+    }
+    if ( !$ok ) {
+        croak "Installation failed: $stderr";
+    }
+
+    $self->_find_ollama();
+    return $self->is_installed;
 }
 
 sub start {
     my $self = shift;
 
-    croak "Ollama is not installed" unless $self->is_installed;
-
-    # Check if already running
-    return 1 if $self->status eq 'RUNNING';
-
-    # Start ollama serve in background
-    my $pid = fork();
-    croak "Failed to fork: $!" unless defined $pid;
-
-    if ( $pid == 0 ) {
-
-        # Child process
-        exec( $self->{ollama_path}, 'serve' );
-        exit 1;    # Should never reach here
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
     }
 
-    # Parent process - wait a bit and verify process started
+    if ( $self->status eq 'RUNNING' ) {
+        return;
+    }
+
+    my $cmd;
+    eval { $cmd = System::Command->new( $self->{ollama_path}, 'serve' ); 1 }
+        or croak "Failed to start ollama serve: $EVAL_ERROR";
+
+    # Detach by closing all handles; let external supervisor keep it alive
+    for my $fh ( $cmd->stdin, $cmd->stdout, $cmd->stderr ) {
+        eval { close $fh or carp "Failed to close handle: $EVAL_ERROR" }
+            or carp "Failed to close handle: $EVAL_ERROR";
+    }
+
     sleep 1;
     return $self->status eq 'RUNNING';
 }
 
 sub stop {
-    my $self = shift;
-    my %args = @_;
+    my ( $self, %args ) = @_;
 
-    croak "Ollama is not installed" unless $self->is_installed;
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
+    }
 
-    # Get running server PID
     my $pid = $self->pid;
-    return 1 unless $pid;    # Already stopped
+    if ( !$pid ) {
+        return 1;
+    }
 
-    # Try graceful shutdown first
     kill 'TERM', $pid;
 
-    # Wait for process to stop
-    my $timeout = $args{timeout} || 10;
+    my $timeout = $args{timeout} || $ENV{OLLAMA_MANAGER_STOP_TIMEOUT} || $TIMEOUT_SECONDS;
     my $waited  = 0;
     while ( $waited < $timeout ) {
         sleep 1;
         $waited++;
-        return 1 unless kill( 0, $pid );
+        if ( !kill 0, $pid ) {
+            return 1;
+        }
     }
 
-    # If still running, force kill
-    if ( kill( 0, $pid ) ) {
+    if ( kill 0, $pid ) {
         kill 'KILL', $pid;
-        carp "Had to forcefully kill Ollama process";
+        carp 'Had to forcefully kill Ollama process';
     }
 
     return 1;
 }
 
 sub restart {
-    my $self = shift;
-    my %args = @_;
+    my ( $self, %args ) = @_;
 
-    return 0 unless $self->stop(%args);
+    if ( !$self->stop(%args) ) {
+        return;
+    }
+
     return $self->start();
 }
 
 sub status {
     my $self = shift;
 
-    croak "Ollama is not installed" unless $self->is_installed;
-
-    # Use 'ollama ps' to check running status
-    my ( $stdout, $stderr );
-    if ( run( [ $self->{ollama_path}, 'ps' ], '>', \$stdout, '2>', \$stderr ) ) {
-        return 'RUNNING' if $stdout =~ /ollama serve/;
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
     }
 
-    return 'STOPPED';
+    if ( !$ENV{OLLAMA_MANAGER_DISABLE_HTTP} && $self->_http_is_alive() ) {
+        return 'RUNNING';
+    }
+
+    my $pid = $self->pid;
+    return defined $pid ? 'RUNNING' : 'STOPPED';
+}
+
+sub _http_is_alive {
+    my ($self) = @_;
+    my $http   = HTTP::Tiny->new( timeout => 2 );
+    my $res    = $http->get('http://127.0.0.1:11434/api/version');
+    return $res->{success} ? 1 : 0;
+}
+
+sub _is_ollama_serve_pid {
+    my ( $self, $pid ) = @_;
+
+    return 0 if !defined $pid || $pid !~ /^\d+$/xms;
+    return 0 if !kill 0, $pid;
+
+    my ( $ok_ps, $cmd ) = $self->_run_cmd( [ 'ps', '-p', $pid, '-o', 'command=' ], timeout => 2 );
+    return 0 if !$ok_ps;
+    my $lc = lc( $cmd // q{} );
+    return ( $lc =~ /ollama/xms && $lc =~ /serve/xms ) ? 1 : 0;
+}
+
+sub _pid_via_proc_table {
+    my ($self) = @_;
+
+    my $have_ppt = eval { require Proc::ProcessTable; 1 };
+    return if !$have_ppt;
+
+    my $t = Proc::ProcessTable->new();
+    for my $p ( @{ $t->table } ) {
+        next if !$p || !$p->pid;
+        my $cmnd = $p->cmndline // $p->fname // q{};
+        my $lc   = lc $cmnd;
+        next           if $lc !~ /ollama/xms || $lc !~ /serve/xms;
+        return $p->pid if $self->_is_ollama_serve_pid( $p->pid );
+    }
+    return;
+}
+
+sub _pid_via_lsof {
+    my ($self) = @_;
+
+    my ( $ok_lsof, $lsof_out )
+        = $self->_run_cmd( [ 'lsof', '-nP', qq{-iTCP:$LISTEN_PORT}, '-sTCP:LISTEN', '-Fp' ], timeout => 3 );
+    return if !$ok_lsof || !$lsof_out;
+
+    for my $line ( split /\n/xms, $lsof_out ) {
+        my ($pid) = $line =~ /^p(\d+)/xms;
+        next        if !$pid;
+        return $pid if $self->_is_ollama_serve_pid($pid);
+    }
+    return;
+}
+
+sub _pid_via_pgrep {
+    my ($self) = @_;
+
+    my ( $ok_pgrep, $pgrep_out ) = $self->_run_cmd( [ 'pgrep', '-f', 'ollama serve' ], timeout => 2 );
+    return if !$ok_pgrep || !$pgrep_out;
+
+    my @pids = grep {/^\d+$/xms} split /\s+/xms, $pgrep_out;
+    for my $pid (@pids) {
+        return $pid if $self->_is_ollama_serve_pid($pid);
+    }
+    return;
 }
 
 sub pid {
     my $self = shift;
 
-    croak "Ollama is not installed" unless $self->is_installed;
-
-    # Use pgrep to find the server process
-    my $pid = eval {
-        local $SIG{ALRM} = sub { die "timeout\n" };
-        alarm 5;    # 5 second timeout
-        my $result = qx(pgrep -f 'ollama serve');
-        alarm 0;
-        return $result;
-    };
-
-    if ($@) {
-        if ( $@ eq "timeout\n" ) {
-            carp "Timeout while finding Ollama process";
-            return;
-        }
-        carp "Error finding Ollama process: $@";
-        return;
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
     }
 
-    chomp $pid;
-    return unless $pid && $pid =~ /^\d+$/;
+    my $pid = $self->_pid_via_proc_table();
+    return $pid if defined $pid;
 
-    # Verify the process is still running and is actually ollama
-    if ( kill( 0, $pid ) ) {
-        my $cmd = qx(ps -p $pid -o command=);
-        return $pid if $cmd && $cmd =~ /ollama serve/;
-    }
+    $pid = $self->_pid_via_lsof();
+    return $pid if defined $pid;
+
+    $pid = $self->_pid_via_pgrep();
+    return $pid if defined $pid;
 
     return;
 }
 
-# Additional Ollama CLI Methods
+sub _run_ollama_cmd {
+    my ( $self, $subcmd, $fail_msg, $args, $arg_order ) = @_;
+
+    if ( !$self->is_installed ) {
+        croak 'Ollama is not installed';
+    }
+
+    my @cmd = ( $self->{ollama_path}, $subcmd );
+    if ( $arg_order && ref $arg_order eq 'ARRAY' ) {
+        for my $arg ( @{$arg_order} ) {
+            if ( exists $args->{$arg} && defined $args->{$arg} ) {
+                if ( ref $args->{$arg} eq 'ARRAY' ) {
+                    CORE::push @cmd, @{ $args->{$arg} };
+                }
+                else {
+                    CORE::push @cmd, $args->{$arg};
+                }
+            }
+        }
+    }
+
+    # Always append extra_args if present and not already handled
+    my $has_extra_args = grep { $_ eq 'extra_args' } @{ $arg_order // [] };
+    if ( !$arg_order || !$has_extra_args ) {
+        if ( $args->{extra_args} ) {
+            CORE::push @cmd, @{ $args->{extra_args} };
+        }
+    }
+    my ( $ok, $stdout, $stderr ) = $self->_run_cmd( \@cmd, timeout => $TIMEOUT_SECONDS );
+    if ( !$ok ) {
+        croak "$fail_msg: $stderr";
+    }
+    return $stdout;
+}
 
 sub create {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'create' );
-    CORE::push @cmd, $args{modelfile}       if $args{modelfile};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to create model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'create', 'Failed to create model', \%args, [qw(modelfile extra_args)] );
 }
 
 sub show {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'show' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to show model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'show', 'Failed to show model', \%args, [qw(model extra_args)] );
 }
 
 sub run_model {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'run' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to run model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'run', 'Failed to run model', \%args, [qw(model extra_args)] );
 }
 
 sub stop_model {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'stop' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to stop model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'stop', 'Failed to stop model', \%args, [qw(model extra_args)] );
 }
 
 sub pull {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'pull' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to pull model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'pull', 'Failed to pull model', \%args, [qw(model extra_args)] );
 }
 
-sub push {
+sub push {    ## no critic (Subroutines::ProhibitBuiltinHomonyms)
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'push' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to push model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'push', 'Failed to push model', \%args, [qw(model extra_args)] );
 }
 
 sub list {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'list' );
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to list models: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'list', 'Failed to list models', \%args, [qw(extra_args)] );
 }
 
 sub ps {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'ps' );
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to list running models: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'ps', 'Failed to list running models', \%args, [qw(extra_args)] );
 }
 
 sub cp {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'cp' );
-    CORE::push @cmd, $args{src}             if $args{src};
-    CORE::push @cmd, $args{dest}            if $args{dest};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to copy model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'cp', 'Failed to copy model', \%args, [qw(src dest extra_args)] );
 }
 
 sub rm {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'rm' );
-    CORE::push @cmd, $args{model}           if $args{model};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to remove model: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'rm', 'Failed to remove model', \%args, [qw(model extra_args)] );
 }
 
 sub help {
     my ( $self, %args ) = @_;
-    croak "Ollama is not installed" unless $self->is_installed;
-    my @cmd = ( $self->{ollama_path}, 'help' );
-    CORE::push @cmd, $args{command}         if $args{command};
-    CORE::push @cmd, @{ $args{extra_args} } if $args{extra_args};
-    my ( $stdout, $stderr );
-    my $success = run( \@cmd, '>', \$stdout, '2>', \$stderr );
-    croak "Failed to get help: $stderr" unless $success;
-    return $stdout;
+    return $self->_run_ollama_cmd( 'help', 'Failed to get help', \%args, [qw(command extra_args)] );
 }
 
 1;
@@ -413,6 +479,7 @@ Ollama::Manager - Perl interface for managing Ollama installation and server pro
     
     # Stop the server
     $ollama->stop();
+
 
 =head1 DESCRIPTION
 
@@ -486,178 +553,6 @@ Returns the server status: 'RUNNING' or 'STOPPED'.
 =item pid()
 
 Returns the PID of the running Ollama server process, or undef if not running.
-
-=item create(%args)
-
-Creates a new model. Accepts:
-
-=over 4
-
-=item modelfile
-
-Path to the model file.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'create' command.
-
-=back
-
-=item show(%args)
-
-Displays information about a model. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to show.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'show' command.
-
-=back
-
-=item run_model(%args)
-
-Runs a model. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to run.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'run' command.
-
-=back
-
-=item stop_model(%args)
-
-Stops a running model. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to stop.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'stop' command.
-
-=back
-
-=item pull(%args)
-
-Pulls a model from a repository. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to pull.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'pull' command.
-
-=back
-
-=item push(%args)
-
-Pushes a model to a repository. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to push.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'push' command.
-
-=back
-
-=item list(%args)
-
-Lists available models. Accepts:
-
-=over 4
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'list' command.
-
-=back
-
-=item ps(%args)
-
-Lists running models. Accepts:
-
-=over 4
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'ps' command.
-
-=back
-
-=item cp(%args)
-
-Copies a model. Accepts:
-
-=over 4
-
-=item src
-
-Source model name.
-
-=item dest
-
-Destination model name.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'cp' command.
-
-=back
-
-=item rm(%args)
-
-Removes a model. Accepts:
-
-=over 4
-
-=item model
-
-Name of the model to remove.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'rm' command.
-
-=back
-
-=item help(%args)
-
-Displays help for a command. Accepts:
-
-=over 4
-
-=item command
-
-Name of the command to display help for.
-
-=item extra_args
-
-Array reference of additional arguments to pass to the 'help' command.
-
-=back
 
 =back
 

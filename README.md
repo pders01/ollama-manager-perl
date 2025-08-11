@@ -1,6 +1,6 @@
 # Ollama::Manager
 
-A Perl module for managing the Ollama application lifecycle, including installation, updates, and controlling the server process.
+A Perl module and CLI for managing the Ollama application lifecycle, including installation, updates, process health, and service management.
 
 ## Installation
 
@@ -8,29 +8,27 @@ A Perl module for managing the Ollama application lifecycle, including installat
 # Install dependencies
 cpanm --installdeps .
 
-# Build and install
+# Build and test
 perl Makefile.PL
 make
 make test
+
+# Install (optional)
 make install
 ```
 
 ## Dependencies
 
 - Perl 5.32.0 or later
-- Core Perl modules:
-  - File::Spec
-  - File::Which
-  - POSIX
-  - Carp
-  - Scalar::Util
-  - Cwd
-  - HTTP::Tiny
-  - File::Temp
-- Non-core Perl module:
-  - IPC::Run
+- Runtime modules:
+  - File::Which, POSIX, Carp, Cwd, HTTP::Tiny, File::Temp
+  - Const::Fast
+  - Proc::ProcessTable (optional, for PID enumeration)
+  - System::Command, IO::Select (process execution with streaming and timeouts)
+- Test modules:
+  - Test::More, Test::Exception, Time::HiRes, File::Temp
 
-## Usage
+## Library usage
 
 ```perl
 use Ollama::Manager;
@@ -39,72 +37,96 @@ use Ollama::Manager;
 my $ollama = Ollama::Manager->new();
 
 # Install Ollama if not present
-if (!$ollama->is_installed) {
-    $ollama->install();
-}
+$ollama->install() unless $ollama->is_installed;
 
-# Start the server
+# Start the server (falls back to spawning the daemon)
 $ollama->start();
 
-# Check status
+# Check status (HTTP health first, then PID checks)
 if ($ollama->status eq 'RUNNING') {
-    print "Ollama is running (PID: " . $ollama->pid . ")\n";
+  print "Ollama is running (PID: " . ($ollama->pid // 'unknown') . ")\n";
 }
 
 # Stop the server
 $ollama->stop();
 ```
 
-## Methods
+### Methods
 
-### new(%args)
+- `new(%args)`
+  - `ollama_path`: explicit path to the `ollama` executable
+  - `install_url`: URL for the Ollama installation script
+- `is_installed()` → boolean
+- `version()` → string
+- `install(%args)`
+  - `force`: re-install even if already installed
+- `start()` → boolean
+- `stop(%args)` → boolean
+  - `timeout`: graceful shutdown timeout seconds (default 10)
+- `restart(%args)` → boolean
+- `status()` → `'RUNNING' | 'STOPPED'`
+- `pid()` → PID number or undef
+- CLI wrappers: `create`, `show`, `run_model`, `stop_model`, `pull`, `push`, `list`, `ps`, `cp`, `rm`, `help`
 
-Constructor. Accepts the following optional arguments:
+## Service adapters
 
-- `ollama_path`: Explicit path to the ollama executable
-- `install_url`: URL for the Ollama installation script
+To integrate with init systems instead of manual process control:
 
-### is_installed()
+- `Ollama::Service::Systemd`
+  - start/stop/status/pid using `systemctl` (user or system scope)
+  - constructor: `new(unit => 'ollama', scope => 'user'|'system')`
+- `Ollama::Service::Launchd`
+  - start/stop/status/pid using `launchctl` (gui/$UID or system domain)
+  - constructor: `new(label => 'com.ollama.ollama', scope => 'gui'|'system', uid => $EUID)`
+  - If `label` is omitted, auto-detects labels containing `ollama` and prefers active ones and known patterns.
 
-Returns true if Ollama is installed and accessible.
+These are intended to be injected into higher-level tools (the CLI does this for you).
 
-### version()
+## CLI
 
-Returns the installed Ollama version.
+The `bin/ollama-manager-cli` tool wraps the library and optionally the service adapters.
 
-### install(%args)
+Global options:
+- `--ollama-path PATH`     path to `ollama`
+- `--no-http-health`       disable HTTP health checks in status detection
+- `--service NAME`         `auto` (default), `launchd`, `systemd`, or `none`
+- `--systemd-scope S`      `user` (default) or `system`
+- `--systemd-unit U`       systemd unit name (default: `ollama`)
+- `--launchd-scope S`      `gui` (default) or `system`
+- `--launchd-label L`      launchd label (default auto-detect)
 
-Installs Ollama. Accepts:
+Common commands:
+- `status`      → prints `RUNNING` or `STOPPED`
+- `pid`         → prints PID or empty if unknown
+- `version`     → prints `Ollama version: X.Y.Z`
+- `is-installed`
+- `start-server`, `stop-server`
+- `list`, `ps`, `pull`, `push`, `show`, `run`, `stop`, `create`, `cp`, `rm`, `help`
 
-- `force`: Force reinstallation even if already installed
+Examples (macOS):
+```bash
+# Auto-detect launchd label and print PID
+./bin/ollama-manager-cli --service launchd pid
 
-### start()
+# Explicitly use a specific label
+label=$(launchctl list | awk '/application\.com\.electron\.ollama/ {print $3; exit}')
+./bin/ollama-manager-cli --service launchd --launchd-label "$label" status
+```
 
-Starts the Ollama server process.
+Examples (systemd):
+```bash
+# User scope
+./bin/ollama-manager-cli --service systemd --systemd-scope user status
 
-### stop(%args)
+# System scope with custom unit name
+./bin/ollama-manager-cli --service systemd --systemd-scope system --systemd-unit ollama status
+```
 
-Stops the Ollama server process. Accepts:
+## Notes
 
-- `timeout`: Seconds to wait for graceful shutdown before force killing
-
-### restart(%args)
-
-Restarts the Ollama server process.
-
-### status()
-
-Returns the server status: 'RUNNING' or 'STOPPED'.
-
-### pid()
-
-Returns the PID of the running Ollama server process, or undef if not running.
-
-## Important Notes
-
-- The module uses Ollama's built-in commands for process management
-- Installation requires appropriate system permissions
-- The module supports Unix-like systems (Linux, macOS, BSD)
+- Prefer managing the daemon via `systemd`/`launchd` when available.
+- The library uses HTTP health, Proc::ProcessTable, lsof/pgrep, and system adapters to infer status and PID.
+- Installation requires appropriate system permissions.
 
 ## License
 
@@ -116,5 +138,4 @@ Paul Derscheid <me@paulderscheid.xyz>
 
 ## Disclosure
 
-This library was basically one shot by Cursor with my guidance while using auto selection of models.
-Keep that in mind. For more details check [DESIGN.md](DESIGN.md).
+This library was co-developed with Cursor using automated assistance. For design details, see [DESIGN.md](DESIGN.md).
